@@ -659,42 +659,58 @@ class VizardWorker:
         self.log(f"[{vname}] tim thay {n} nut Download")
         # tu dong chap nhan dialog (beforeunload) khong lam treo
         page.on("dialog", lambda d: asyncio.create_task(d.accept()))
+        downloads_folder = Path.home() / "Downloads"
         for i in range(n):
             try:
                 btn = page.locator(sel).nth(i)
-                # cuon nut vao giua khung nhin (nut co the nam ngoai man hinh)
                 try:
                     await btn.scroll_into_view_if_needed(timeout=8000)
                     await btn.evaluate("el => el.scrollIntoView({block:'center'})")
                 except Exception:
                     pass
                 await page.wait_for_timeout(600)
-                # thu tai; neu timeout thi click bang JS roi thu lai
-                d = None
-                for attempt in range(2):
-                    try:
-                        async with page.expect_download(timeout=45000) as di:
-                            if attempt == 0:
-                                await btn.click(timeout=10000, force=True)
+                # ghi nhan file Downloads truoc khi bam
+                before = set(f.name for f in downloads_folder.glob("*.mp4") if f.is_file())
+                # bam Download (Chrome tu tai, khong dung expect_download vi no khong bat duoc event)
+                try:
+                    await btn.click(timeout=10000, force=True)
+                except Exception:
+                    await btn.evaluate("el => el.click()")
+                self.log(f"[{vname}] dang cho file tai xuong (clip {i+1})...")
+                # cho file moi xuat hien trong Downloads (timeout 90s)
+                new_file = None
+                for _ in range(90):
+                    await asyncio.sleep(1)
+                    after = set(f.name for f in downloads_folder.glob("*.mp4") if f.is_file())
+                    diff = after - before
+                    if diff:
+                        # lay file lon nhat (truong hop nhieu file cung luc)
+                        candidates = [downloads_folder / fn for fn in diff]
+                        new_file = max(candidates, key=lambda f: f.stat().st_size if f.exists() else 0)
+                        # doi cho file khong con tang kich thuoc (tai xong)
+                        stable = 0
+                        last_sz = 0
+                        while stable < 3:
+                            await asyncio.sleep(1)
+                            sz = new_file.stat().st_size if new_file.exists() else 0
+                            if sz == last_sz:
+                                stable += 1
                             else:
-                                await btn.evaluate("el => el.click()")
-                        d = await di.value
+                                stable = 0
+                                last_sz = sz
                         break
-                    except Exception as ce:
-                        if attempt == 1:
-                            raise
-                        self.log(f"[{vname}] clip {i+1} click lai...")
-                        await page.wait_for_timeout(1000)
-                fn = d.suggested_filename or f"clip_{i+1:02d}.mp4"
-                # sanitize
-                fn = re.sub(r'[\\/:*?"<>|]', "_", fn)
+                if not new_file or not new_file.exists():
+                    raise RuntimeError(f"Khong tim thay file tai xuong clip {i+1}")
+                # copy sang dest_dir + doi ten
+                fn = re.sub(r'[\\/:*?"<>|]', "_", new_file.name)
                 out = dest_dir / fn
                 k = 1
                 while out.exists():
                     out = dest_dir / f"{Path(fn).stem}_{k}{Path(fn).suffix}"; k += 1
-                await d.save_as(str(out))
+                import shutil
+                shutil.move(str(new_file), str(out))
                 self.log(f"[{vname}] tai: {out.name} ({out.stat().st_size/1024:.0f}KB)")
-                # hau xu ly: che mo logo (neu bat) + cat 2.5s cuoi
+                # hau xu ly: che mo logo + cat 2.5s cuoi
                 final = await asyncio.to_thread(self._blur_watermark, str(out))
                 downloaded.append(final)
             except Exception as e:
@@ -1217,12 +1233,7 @@ class App:
                 self.log("Khong co profile GPM nao!"); return
             self.pool_lock = threading.Lock()
             self.pool_idx = 0  # con tro profile tiep theo de cap phat
-            # kich thuoc man hinh de xep luoi cua so Chrome
-            try:
-                self._screen_w = self.root.winfo_screenwidth()
-                self._screen_h = self.root.winfo_screenheight()
-            except Exception:
-                self._screen_w, self._screen_h = 1920, 1080
+            self._hidden_flag = bool(cfg.get("hidden", False))
 
             ai_root = out_root / "AI Vizard"
             ai_root.mkdir(parents=True, exist_ok=True)
@@ -1273,37 +1284,33 @@ class App:
         while len(pages) < tabs_per:
             pages.append(await ctx.new_page())
         pages = pages[:tabs_per]
-        # xep cua so Chrome thanh luoi tren man hinh (moi profile 1 o nho)
+        # chay ngam + force bat auto-download
+        if self._hidden_flag:
+            try:
+                await self._hide_window(pages[0])
+            except Exception as e:
+                self.log(f"[W{wi+1}] khong the an cua so: {str(e)[:60]}")
+        # force Chrome auto-download (khong hoi)
         try:
-            await self._tile_window(pages[0], wi)
-        except Exception as e:
-            self.log(f"[W{wi+1}] khong the xep cua so: {str(e)[:60]}")
+            cdp = await pages[0].context.new_cdp_session(pages[0])
+            await cdp.send("Browser.setDownloadBehavior", {
+                "behavior": "allow", "downloadPath": str(Path.home() / "Downloads")})
+            await cdp.detach()
+        except Exception:
+            pass
         return pw_obj, browser, pages
 
-    async def _tile_window(self, page, wi):
-        """Xep cua so Chrome cua profile thu wi thanh o nho tren man hinh.
-        Luoi 3 cot x 2 hang = 6 o. Profile thu 7 tro di lap lai vi tri."""
-        sw = getattr(self, "_screen_w", 1920)
-        sh = getattr(self, "_screen_h", 1080)
-        cols, rows = 3, 2
-        cell = wi % (cols * rows)
-        cx = cell % cols
-        cy = cell // cols
-        margin = 4
-        w = sw // cols - margin
-        h = sh // rows - margin
-        left = cx * (sw // cols)
-        top = cy * (sh // rows)
+    async def _hide_window(self, page):
+        """Day cua so Chrome ra ngoai man hinh roi minimize (chay ngam)."""
         cdp = await page.context.new_cdp_session(page)
         try:
             info = await cdp.send("Browser.getWindowForTarget")
             wid = info["windowId"]
-            # bo minimize/maximize truoc roi dat vi tri
-            await cdp.send("Browser.setWindowBounds", {
-                "windowId": wid, "bounds": {"windowState": "normal"}})
             await cdp.send("Browser.setWindowBounds", {
                 "windowId": wid,
-                "bounds": {"left": left, "top": top, "width": w, "height": h}})
+                "bounds": {"left": -32000, "top": -32000, "width": 1000, "height": 800}})
+            await cdp.send("Browser.setWindowBounds", {
+                "windowId": wid, "bounds": {"windowState": "minimized"}})
         finally:
             try: await cdp.detach()
             except Exception: pass
