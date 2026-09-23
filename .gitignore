@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# App state / cache
+state.json
+*.log
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ffmpeg / downloads cache
+*.zip
