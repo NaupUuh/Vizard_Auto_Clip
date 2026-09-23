@@ -619,24 +619,22 @@ class VizardWorker:
     async def _download_all(self, page, dest_dir, vname):
         dest_dir = Path(dest_dir); dest_dir.mkdir(parents=True, exist_ok=True)
         downloaded = []
-        spans = page.locator("span:text-is('Download')")
-        n = await spans.count()
+        # nut Download rieng tung clip (bo qua nut "batch download" o tren cung -
+        # no bi disabled khi chua Select all). Chi nut nay moi tai truc tiep.
+        sel = "div.border-button.narrow-video-button:has-text('Download')"
+        btns = page.locator(sel)
+        n = await btns.count()
         self.log(f"[{vname}] tim thay {n} nut Download")
+        # tu dong chap nhan dialog (beforeunload) khong lam treo
+        page.on("dialog", lambda d: asyncio.create_task(d.accept()))
         for i in range(n):
             try:
-                btn = page.locator("span:text-is('Download')").nth(i)
+                btn = page.locator(sel).nth(i)
+                await btn.scroll_into_view_if_needed(timeout=5000)
                 if not await btn.is_visible():
                     continue
-                async with page.expect_download(timeout=60000) as di:
+                async with page.expect_download(timeout=90000) as di:
                     await btn.click()
-                    await page.wait_for_timeout(1500)
-                    # dismiss any resolution / confirm popup by re-clicking a Download in it
-                    try:
-                        conf = page.locator("div.download-now, button:has-text('Download'), div:has-text('Download now')")
-                        if await conf.count():
-                            await conf.last.click(timeout=2500)
-                    except Exception:
-                        pass
                 d = await di.value
                 fn = d.suggested_filename or f"clip_{i+1:02d}.mp4"
                 # sanitize
