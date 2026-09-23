@@ -930,7 +930,7 @@ class App:
         ttk.Entry(outf, textvariable=self.output_v).pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(outf, text="Browse", command=lambda: self.output_v.set(
             filedialog.askdirectory() or self.output_v.get())).pack(side="left")
-        ttk.Label(inf, text="(Clip se luu vao thu muc con 'AI Vizard' trong Output goc)",
+        ttk.Label(inf, text="(Clip gop theo folder: AI Vizard/<ten-folder-con>/)",
                   foreground="#888").pack(anchor="w", pady=(3,0))
 
         # ---- YouTube panel ----
@@ -1370,10 +1370,13 @@ class App:
     @staticmethod
     def _job_dest(ai_root, kind, payload):
         if kind == "file":
-            # tao folder 'AI Vizard/<ten-video>' NGAY TRONG thu muc chua video nguon
+            # gop tat ca clip cua 1 bo phim (nhieu tap) vao 1 folder chung:
+            # ai_root / "AI Vizard" / <ten-folder-con-chua-video> / (gop het clip vao day)
             src = Path(payload)
-            return src.parent / "AI Vizard" / src.stem
-        # link: khong co folder nguon -> dung Output goc
+            # ten folder con (bo phim) = folder cha cua video
+            series_folder = src.parent.name
+            return ai_root / series_folder
+        # link: khong co folder nguon -> dung Output goc truc tiep
         vid = payload.rsplit("=", 1)[-1].rsplit("/", 1)[-1][:20]
         return ai_root / f"yt_{vid}"
 
