@@ -248,8 +248,6 @@ class GPMClient:
 
     def start_profile(self, pid, hidden=False):
         params = {"skip_proxy_check": "true"}
-        if hidden:
-            params["win_scale"] = "0.5"   # nho lai; se day ra ngoai man hinh sau khi attach
         return self._get(f"/profiles/start/{pid}", params, timeout=120)
 
     def stop_profile(self, pid):
@@ -453,34 +451,68 @@ class VizardWorker:
         await page.locator("div.submit-clip-button").first.click()
         self.log(f"[{vname}] dang tao clip (cho 2-8 phut)...")
 
-        # 7) wait for results /project/ (het-credit + treo 98%)
+        # 7) wait for results /project/ (theo BUOC, chong treo)
         deadline = time.time() + cfg.get("timeout", 1800)
+        # cac buoc Vizard hien theo thu tu; map sang ten tieng Viet de log
+        STEPS = [
+            ("upload", "Upload"),
+            ("create project", "Tao project"),
+            ("process video", "Xu ly video"),
+            ("find best parts", "Tim doan hay nhat"),
+            ("edit clips", "Chinh sua clip"),
+            ("finalizing", "Hoan thien"),
+        ]
+        last_step = None
         last_pct = None
-        stuck_since = time.time()
-        STUCK_LIMIT = 100
+        # moc thoi gian de phat hien treo: reset moi khi BUOC doi (khong theo %)
+        step_since = time.time()
+        NO_PROGRESS_LIMIT = 180  # qua 180s ma khong sang buoc moi -> reload 1 lan
+        reloaded_once = False
         while time.time() < deadline:
             if stop_fn(): raise RuntimeError("Stopped")
             await asyncio.sleep(8)
             u = page.url
             if await self._check_credit_exhausted(page):
                 raise CreditExhausted("Profile het credit")
-            body = (await page.inner_text("body")).lower()
+            body_raw = await page.inner_text("body")
+            body = body_raw.lower()
             if "/project/" in u and any(k in body for k in
                     ["virality", "remove watermark", "publish", "highest"]):
                 self.log(f"[{vname}] clip da san sang!")
                 break
+            # xac dinh buoc hien tai = buoc cuoi cung xuat hien trong noi dung
+            cur_idx = -1
+            for idx, (key, _) in enumerate(STEPS):
+                if key in body:
+                    cur_idx = idx
             m = re.search(r"(\d+)%", body)
-            if m:
-                pct = m.group(1)
-                self.log(f"[{vname}] tien do: {pct}%")
-                if pct != last_pct:
+            pct = m.group(1) if m else None
+            if cur_idx >= 0:
+                label = STEPS[cur_idx][1]
+                extra = f" {pct}%" if (pct and cur_idx == len(STEPS)-1) else ""
+                msg = f"buoc {cur_idx+1}/{len(STEPS)}: {label}{extra}"
+                if cur_idx != last_step or pct != last_pct:
+                    self.log(f"[{vname}] {msg}")
                     last_pct = pct
-                    stuck_since = time.time()
-                elif time.time() - stuck_since > STUCK_LIMIT:
-                    if _retry >= 2:
-                        raise RuntimeError(f"treo {pct}% sau {_retry+1} lan thu")
-                    self.log(f"[{vname}] treo {pct}% qua {STUCK_LIMIT}s -> tai lai & lam lai (lan {_retry+1})")
+                if cur_idx != last_step:
+                    last_step = cur_idx
+                    step_since = time.time()   # sang buoc moi -> reset dong ho treo
+            # treo: qua lau khong sang buoc moi (du % co nhay)
+            if time.time() - step_since > NO_PROGRESS_LIMIT:
+                if not reloaded_once:
+                    reloaded_once = True
+                    step_since = time.time()
+                    self.log(f"[{vname}] treo qua {NO_PROGRESS_LIMIT}s -> tai lai trang de tiep tuc...")
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(4000)
+                elif _retry < 2:
+                    self.log(f"[{vname}] van treo -> lam lai tu dau (lan {_retry+1})")
                     return await retry_fn(_retry + 1)
+                else:
+                    raise RuntimeError(f"treo qua lau sau {_retry+1} lan thu")
         else:
             raise RuntimeError("Timeout cho Vizard gen clip")
 
@@ -630,12 +662,29 @@ class VizardWorker:
         for i in range(n):
             try:
                 btn = page.locator(sel).nth(i)
-                await btn.scroll_into_view_if_needed(timeout=5000)
-                if not await btn.is_visible():
-                    continue
-                async with page.expect_download(timeout=90000) as di:
-                    await btn.click()
-                d = await di.value
+                # cuon nut vao giua khung nhin (nut co the nam ngoai man hinh)
+                try:
+                    await btn.scroll_into_view_if_needed(timeout=8000)
+                    await btn.evaluate("el => el.scrollIntoView({block:'center'})")
+                except Exception:
+                    pass
+                await page.wait_for_timeout(600)
+                # thu tai; neu timeout thi click bang JS roi thu lai
+                d = None
+                for attempt in range(2):
+                    try:
+                        async with page.expect_download(timeout=45000) as di:
+                            if attempt == 0:
+                                await btn.click(timeout=10000, force=True)
+                            else:
+                                await btn.evaluate("el => el.click()")
+                        d = await di.value
+                        break
+                    except Exception as ce:
+                        if attempt == 1:
+                            raise
+                        self.log(f"[{vname}] clip {i+1} click lai...")
+                        await page.wait_for_timeout(1000)
                 fn = d.suggested_filename or f"clip_{i+1:02d}.mp4"
                 # sanitize
                 fn = re.sub(r'[\\/:*?"<>|]', "_", fn)
@@ -923,7 +972,7 @@ class App:
         ttk.Checkbutton(cbf, text="Remove silences", variable=self.silences_v).pack(side="left", padx=6)
         ttk.Checkbutton(cbf, text="Auto-censor", variable=self.censor_v).pack(side="left", padx=6)
         ttk.Checkbutton(cbf, text="Che mo logo Vizard", variable=self.blur_wm_v).pack(side="left", padx=6)
-        ttk.Checkbutton(cbf, text="Chay ngam (an cua so)", variable=self.hidden_v).pack(side="left", padx=6)
+        ttk.Label(cbf, text="(Cua so Chrome tu xep luoi 3x2 tren man hinh)", foreground="#888").pack(side="left", padx=6)
 
         # stats + progress
         st = ttk.Frame(outer); st.pack(fill="x", pady=(8,0))
@@ -1168,7 +1217,12 @@ class App:
                 self.log("Khong co profile GPM nao!"); return
             self.pool_lock = threading.Lock()
             self.pool_idx = 0  # con tro profile tiep theo de cap phat
-            self._hidden_flag = bool(cfg.get("hidden", False))
+            # kich thuoc man hinh de xep luoi cua so Chrome
+            try:
+                self._screen_w = self.root.winfo_screenwidth()
+                self._screen_h = self.root.winfo_screenheight()
+            except Exception:
+                self._screen_w, self._screen_h = 1920, 1080
 
             ai_root = out_root / "AI Vizard"
             ai_root.mkdir(parents=True, exist_ok=True)
@@ -1210,7 +1264,7 @@ class App:
     async def _open_profile(self, wi, gpm, pid, tabs_per):
         """Start 1 profile GPM, attach, mo tabs_per tab. Tra (pw, browser, [pages])."""
         self.log(f"[W{wi+1}] start profile {pid}...")
-        data = await asyncio.to_thread(gpm.start_profile, pid, self._hidden_flag)
+        data = await asyncio.to_thread(gpm.start_profile, pid, False)
         ws = await asyncio.to_thread(GPMClient.ws_from_start, data)
         worker = VizardWorker(self.log)
         pw_obj, browser = await worker.attach(ws)
@@ -1219,27 +1273,37 @@ class App:
         while len(pages) < tabs_per:
             pages.append(await ctx.new_page())
         pages = pages[:tabs_per]
-        # chay ngam: day cua so ra ngoai man hinh + minimize
-        if self._hidden_flag:
-            try:
-                await self._hide_window(pages[0])
-            except Exception as e:
-                self.log(f"[W{wi+1}] khong the an cua so: {str(e)[:60]}")
+        # xep cua so Chrome thanh luoi tren man hinh (moi profile 1 o nho)
+        try:
+            await self._tile_window(pages[0], wi)
+        except Exception as e:
+            self.log(f"[W{wi+1}] khong the xep cua so: {str(e)[:60]}")
         return pw_obj, browser, pages
 
-    async def _hide_window(self, page):
-        """Day cua so Chrome ra ngoai man hinh roi minimize (chay ngam)."""
-        # dung CDP Browser.getWindowForTarget + setWindowBounds qua session
+    async def _tile_window(self, page, wi):
+        """Xep cua so Chrome cua profile thu wi thanh o nho tren man hinh.
+        Luoi 3 cot x 2 hang = 6 o. Profile thu 7 tro di lap lai vi tri."""
+        sw = getattr(self, "_screen_w", 1920)
+        sh = getattr(self, "_screen_h", 1080)
+        cols, rows = 3, 2
+        cell = wi % (cols * rows)
+        cx = cell % cols
+        cy = cell // cols
+        margin = 4
+        w = sw // cols - margin
+        h = sh // rows - margin
+        left = cx * (sw // cols)
+        top = cy * (sh // rows)
         cdp = await page.context.new_cdp_session(page)
         try:
             info = await cdp.send("Browser.getWindowForTarget")
             wid = info["windowId"]
-            # day ra ngoai (toa do am lon) roi minimize
+            # bo minimize/maximize truoc roi dat vi tri
+            await cdp.send("Browser.setWindowBounds", {
+                "windowId": wid, "bounds": {"windowState": "normal"}})
             await cdp.send("Browser.setWindowBounds", {
                 "windowId": wid,
-                "bounds": {"left": -32000, "top": -32000, "width": 1000, "height": 800}})
-            await cdp.send("Browser.setWindowBounds", {
-                "windowId": wid, "bounds": {"windowState": "minimized"}})
+                "bounds": {"left": left, "top": top, "width": w, "height": h}})
         finally:
             try: await cdp.detach()
             except Exception: pass
