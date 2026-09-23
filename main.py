@@ -1024,7 +1024,11 @@ class App:
             return [Path(f) for f in self.selfiles if Path(f).suffix.lower() in VIDEO_EXTS]
         p = self.input_v.get().strip()
         if p and Path(p).is_dir():
-            return sorted([f for f in Path(p).iterdir() if f.suffix.lower() in VIDEO_EXTS])
+            # quet de quy tat ca folder con
+            found = []
+            for ext in VIDEO_EXTS:
+                found.extend(Path(p).rglob(f"*{ext}"))
+            return sorted(set(found))
         return []
 
     # ---- YouTube search ----
