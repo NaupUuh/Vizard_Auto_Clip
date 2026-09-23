@@ -20,7 +20,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "state.json"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".3gp", ".webm", ".m4v", ".flv", ".wmv"}
 TOOL_NOTE = "vizard-tool"
