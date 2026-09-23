@@ -231,9 +231,16 @@ class GPMClient:
                 break
         return out
 
-    def list_tool_profiles(self):
-        return [p for p in self.list_profiles()
-                if str(p.get("note") or "").strip() == TOOL_NOTE]
+    def list_tool_profiles(self, include_exhausted=False):
+        """Lay profile tool, mac dinh bo qua profile het credit."""
+        profiles = []
+        for p in self.list_profiles():
+            note = str(p.get("note") or "").strip()
+            if note.startswith(TOOL_NOTE):
+                if not include_exhausted and "|exhausted:" in note:
+                    continue
+                profiles.append(p)
+        return profiles
 
     def create_profile(self, name):
         data = self._post("/profiles/create",
@@ -255,6 +262,38 @@ class GPMClient:
             return self._get(f"/profiles/stop/{pid}", timeout=60)
         except Exception:
             return None
+
+    def delete_profile(self, pid):
+        """Xoa profile khoi GPM."""
+        try:
+            return self._get(f"/profiles/delete/{pid}", timeout=30)
+        except Exception:
+            return None
+
+    def mark_profile_exhausted(self, pid):
+        """Danh dau profile het credit (luu timestamp vao note)."""
+        try:
+            ts = int(time.time())
+            note = f"{TOOL_NOTE}|exhausted:{ts}"
+            self._post(f"/profiles/update/{pid}", {"note": note})
+        except Exception:
+            pass
+
+    def cleanup_old_exhausted_profiles(self, days=3):
+        """Xoa profile het credit >N ngay khong dung."""
+        cutoff = time.time() - (days * 86400)
+        deleted = 0
+        for p in self.list_profiles():
+            note = str(p.get("note") or "").strip()
+            if "|exhausted:" in note:
+                try:
+                    ts = int(note.split("|exhausted:")[-1])
+                    if ts < cutoff:
+                        self.delete_profile(p["id"])
+                        deleted += 1
+                except Exception:
+                    pass
+        return deleted
 
     @staticmethod
     def ws_from_start(data, tries=15):
@@ -1223,6 +1262,10 @@ class App:
     def _orchestrate(self, jobs, out_root, cfg, nprofiles, tabs_per):
         try:
             gpm = GPMClient(self.gpm_url_v.get().strip())
+            # don dep: xoa profile het credit >3 ngay khong dung
+            deleted = gpm.cleanup_old_exhausted_profiles(days=3)
+            if deleted:
+                self.log(f"Da xoa {deleted} profile het credit >3 ngay")
             self.log(f"Chuan bi {nprofiles} profile GPM (x{tabs_per} tab/profile)...")
             pool = gpm.list_tool_profiles()
             self.profile_pool = [p["id"] for p in pool]   # profiles san co (dung + du phong khi het credit)
@@ -1355,10 +1398,14 @@ class App:
                 self.log(f"[W{wi+1}] da dong profile {pid}")
 
             if credit_flag["dead"] and not self.stop_event.is_set():
-                # profile het credit -> lay profile khac chay tiep (video da duoc requeue)
+                # profile het credit -> danh dau + xoa khoi GPM
+                self.log(f"[W{wi+1}] profile {pid} het credit -> xoa profile")
+                await asyncio.to_thread(gpm.mark_profile_exhausted, pid)
+                await asyncio.to_thread(gpm.delete_profile, pid)
+                # lay profile khac chay tiep (video da duoc requeue)
                 newpid = self._next_profile()
                 if newpid:
-                    self.log(f"[W{wi+1}] profile {pid} het credit -> chuyen sang {newpid}")
+                    self.log(f"[W{wi+1}] chuyen sang profile {newpid}")
                     pid = newpid
                     continue
                 else:
